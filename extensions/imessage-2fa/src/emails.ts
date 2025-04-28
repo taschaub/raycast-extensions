@@ -3,12 +3,13 @@
  * Provides functionality to fetch and process 2FA codes from both Apple Mail and Gmail
  */
 
-import { getPreferenceValues, Icon, Color } from "@raycast/api";
+import { getPreferenceValues, List, Icon, Color } from "@raycast/api";
 import { Message, Preferences, SearchType } from "./types";
-import { calculateLookBackMinutes, extractCode, extractVerificationLink } from "./utils";
+import { calculateLookBackMinutes } from "./utils";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { runAppleScript } from "@raycast/utils";
-import { getGmailMessages, checkGmailAuth, processGmailContent } from "./gmail";
+import { extractCode } from "./utils";
+import { getGmailMessages, checkGmailAuth } from "./gmail";
 import { ErrorView } from "./components/ErrorView";
 import React from "react";
 
@@ -16,10 +17,10 @@ import React from "react";
  * Storage interface for managing email message state
  * Tracks processed messages to avoid duplicate processing
  */
-// interface MessageStorage {
-//   hasCode: Record<string, boolean>; // Maps message IDs to whether they contain codes
-//   latestTimestamp?: number; // Most recent message timestamp for incremental updates
-// }
+interface MessageStorage {
+  hasCode: Record<string, boolean>; // Maps message IDs to whether they contain codes
+  latestTimestamp?: number; // Most recent message timestamp for incremental updates
+}
 
 /**
  * Fetches emails from Apple Mail using AppleScript
@@ -43,7 +44,6 @@ async function getAppleMailMessages(
   // Convert known guids to AppleScript list
   const knownGuidsStr = knownGuids.map((guid) => `"${guid}"`).join(", ");
 
-  // Updated AppleScript to better handle HTML content and quoted-printable encoding
   const script = `
     tell application "Mail"
       try
@@ -53,42 +53,33 @@ async function getAppleMailMessages(
         set output to ""
         set messageCount to 0
         
+        -- Get messages until we've hit a known one or reach cutoff
         repeat with i from 1 to 50
           try
             set m to message i of inb
             set msgId to id of m
-            if knownGuids contains msgId then exit repeat
+            
+            -- Exit if we've seen this message before
+            if knownGuids contains msgId then
+              exit repeat
+            end if
+            
             set msgDate to date received of m
-            if msgDate < cutoffDate then exit repeat
+            -- Exit if message is too old
+            if msgDate < cutoffDate then
+              exit repeat
+            end if
             
             set msgSubject to subject of m
             set msgSender to sender of m
-            
-            -- Improved HTML content handling
-            set htmlContent to ""
-            set plainContent to ""
-            
-            -- Get raw HTML source as the primary target
-            try
-              set htmlContent to source of m
-            on error
-              set htmlContent to ""
-            end try
-            
-            -- Always get plain content as fallback
-            try
-              set plainContent to content of m
-            on error
-              set plainContent to ""
-            end try
-
+            set msgContent to content of m
             set msgDateStr to msgDate as «class isot» as string
             
-            -- Need to ensure we preserve the exact content without line wrapping
-            -- that could confuse quoted-printable encoding
-            set output to output & msgId & "$break$" & msgSubject & "$break$" & msgSender & "$break$" & htmlContent & "$break$" & plainContent & "$break$" & msgDateStr & "$end$"
+            set messageCount to messageCount + 1
+            set output to output & msgId & "$break" & msgSubject & "$break" & msgSender & "$break" & msgContent & "$break" & msgDateStr & "$end"
           end try
         end repeat
+        
         return output
       end try
     end tell
@@ -100,51 +91,24 @@ async function getAppleMailMessages(
       timeout: 10000,
     });
 
-    if (!result) return [];
-
-    // Process using the same logic as Gmail
-    const messages: Message[] = [];
-
-    // Use a more robust split that handles potential content having the delimiter
-    const rawMessages = result.split("$end$").filter((line) => line.trim().length > 0);
-
-    for (const rawMsg of rawMessages) {
-      const parts = rawMsg.split("$break$");
-      if (parts.length < 6) continue; // Skip malformed messages
-
-      const [guid, subject, sender, htmlContent, plainContent, dateStr] = parts;
-
-      // Convert date string to Date object
-      const date = new Date(dateStr);
-
-      // Process HTML content to handle quoted-printable encoding issues
-      // This is particularly important for Apple Mail
-      let processedHtmlContent = htmlContent || "";
-
-      // Handle quoted-printable encoding in HTML content
-      // Fix line continuations (= at end of line followed by newline)
-      processedHtmlContent = processedHtmlContent.replace(/=\r?\n/g, "");
-
-      // Use Gmail's processor function with Apple Mail data
-      const processedMsg = processGmailContent(
-        guid,
-        subject,
-        sender,
-        date,
-        processedHtmlContent || null, // Process HTML content to fix encoding issues
-        plainContent || null, // Plain content
-        "", // No snippet equivalent in Apple Mail
-        lookbackMinutes
-      );
-
-      if (processedMsg) {
-        messages.push(processedMsg);
-      }
+    if (!result) {
+      return [];
     }
 
-    return messages;
+    return result
+      .split("$end")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        const [guid, subject, sender, content, dateStr] = line.split("$break");
+        return {
+          guid,
+          message_date: dateStr,
+          sender,
+          text: `${subject}\n${content}`,
+          source: "email" as const,
+        };
+      });
   } catch (error) {
-    console.error("Failed to fetch Apple Mail messages:", error);
     return [];
   }
 }
@@ -188,20 +152,16 @@ export function useEmails(options: UseEmailsOptions) {
         // Mark as processed
         messageCache.current.add(email.guid);
 
-        // For "all" search type, include all messages regardless of code
-        if (options.searchType === "all") {
-          return true;
-        }
-
-        // For "code" search type, check if there's a code or link
-        const code = extractCode(email.displayText);
+        // Check for code
+        const code = extractCode(email.text);
         const hasCode = code !== null;
 
-        // Also check for verification links (only if enabled in preferences)
-        const hasLink = preferences.enableVerificationLinks !== false && extractVerificationLink(email.text) !== null;
+        // For code-only search, only include messages with codes
+        if (options.searchType === "code") {
+          return hasCode;
+        }
 
-        // Include messages with either codes or links (if links are enabled)
-        return hasCode || hasLink;
+        return true;
       });
 
       if (uniqueEmails.length > 0) {
@@ -214,7 +174,7 @@ export function useEmails(options: UseEmailsOptions) {
         });
       }
     },
-    [options.searchType, preferences.enableVerificationLinks]
+    [options.searchType]
   );
 
   // Main email fetching logic
@@ -309,7 +269,7 @@ export function useEmails(options: UseEmailsOptions) {
         isLoadingRef.current = false;
       }
     },
-    [options.enabled, options.searchType, processNewEmails, emailSource, preferences.enableVerificationLinks]
+    [options.enabled, options.searchType, processNewEmails, emailSource]
   );
 
   // Initial load
